@@ -180,11 +180,11 @@ where
     ///
     /// The message itself is still generic and can be converted into an appropriate type through
     /// the helper methods on it.
-    pub fn on_message(&mut self) -> impl Stream<Item = Msg> + '_ {
+    pub fn on_message(&mut self) -> impl Stream<Item = Result<Option<Msg>, RedisError>> + '_ {
         ValueCodec::default()
             .framed(&mut self.con.con)
             .into_stream()
-            .filter_map(|msg| Box::pin(async move { Msg::from_value(&msg.ok()?) }))
+            .map_ok(|msg| Msg::from_value(&msg))
     }
 
     /// Returns [`Stream`] of [`Msg`]s from this [`PubSub`]s subscriptions consuming it.
@@ -193,11 +193,11 @@ where
     /// the helper methods on it.
     /// This can be useful in cases where the stream needs to be returned or held by something other
     //  than the [`PubSub`].
-    pub async fn into_on_message(self) -> impl Stream<Item = Msg> {
+    pub async fn into_on_message(self) -> impl Stream<Item = Result<Option<Msg>, RedisError>> {
         ValueCodec::default()
             .framed(self.con.con)
             .into_stream()
-            .filter_map(|msg| Box::pin(async move { Msg::from_value(&msg.ok()?) }))
+            .map_ok(|msg| Msg::from_value(&msg))
     }
 
     /// Exits from `PubSub` mode and converts [`PubSub`] into [`Connection`].

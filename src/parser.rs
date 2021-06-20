@@ -141,6 +141,7 @@ where
 
             let unknown = || {
                 line().map(|line| {
+                    println!("Unknown line: {}", &line);
                     RedisError::from((ErrorKind::ResponseError, "Unknown response", format!("Unknown line: {}", line)))
                 })
             };
