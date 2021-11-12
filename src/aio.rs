@@ -1,5 +1,7 @@
 //! Adds experimental async IO support to redis.
 use async_trait::async_trait;
+use futures::stream::MapOk;
+use tokio_util::codec::Framed;
 use std::collections::VecDeque;
 use std::io;
 use std::mem;
@@ -181,10 +183,10 @@ where
     /// The message itself is still generic and can be converted into an appropriate type through
     /// the helper methods on it.
     pub fn on_message(&mut self) -> impl Stream<Item = Result<Option<Msg>, RedisError>> + '_ {
-        ValueCodec::default()
+        let out = ValueCodec::default()
             .framed(&mut self.con.con)
-            .into_stream()
-            .map_ok(|msg| Msg::from_value(&msg))
+            .map_ok(|msg| Msg::from_value(&msg));
+        out
     }
 
     /// Returns [`Stream`] of [`Msg`]s from this [`PubSub`]s subscriptions consuming it.
@@ -194,9 +196,10 @@ where
     /// This can be useful in cases where the stream needs to be returned or held by something other
     //  than the [`PubSub`].
     pub async fn into_on_message(self) -> impl Stream<Item = Result<Option<Msg>, RedisError>> {
-        ValueCodec::default()
-            .framed(self.con.con)
-            .into_stream()
+        PubSubFramed(
+            ValueCodec::default()
+                .framed(self.con.con)
+        )
             .map_ok(|msg| Msg::from_value(&msg))
     }
 
@@ -205,6 +208,25 @@ where
         self.con.exit_pubsub().await.ok();
 
         self.con
+    }
+}
+
+pub struct PubSubFramed<T: AsyncRead + AsyncWrite + Sized>(Framed<T, ValueCodec>);
+
+impl<T: AsyncRead + AsyncWrite + Sized> Stream for PubSubFramed<T> {
+    type Item = <Framed<T, ValueCodec> as Stream>::Item;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        <Framed<T, ValueCodec> as Stream>::poll_next(Pin::new(&mut self.0), cx)
+    }
+}
+
+impl<T: AsyncRead + AsyncWrite + Sized> Drop for PubSubFramed<T> {
+    fn drop(&mut self) {
+        todo!()
     }
 }
 
@@ -236,7 +258,6 @@ where
     pub fn on_message<T: FromRedisValue>(&mut self) -> impl Stream<Item = T> + '_ {
         ValueCodec::default()
             .framed(&mut self.con.con)
-            .into_stream()
             .filter_map(|value| Box::pin(async move { T::from_redis_value(&value.ok()?).ok() }))
     }
 
@@ -244,7 +265,6 @@ where
     pub fn into_on_message<T: FromRedisValue>(self) -> impl Stream<Item = T> {
         ValueCodec::default()
             .framed(self.con.con)
-            .into_stream()
             .filter_map(|value| Box::pin(async move { T::from_redis_value(&value.ok()?).ok() }))
     }
 }
