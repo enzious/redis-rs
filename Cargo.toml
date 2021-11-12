@@ -35,7 +35,8 @@ combine = { version = "4.5", default-features = false, features = ["std"] }
 # Only needed for AIO
 bytes = { version = "1", optional = true }
 futures-util = { version = "0.3.0", default-features = false, optional = true }
-pin-project-lite = { version = "0.2", optional = true }
+pin-project = { version = "1.0.8", optional = true }
+pin-project-lite = { version = "0.2.7", optional = true }
 tokio-util = { version = "0.6", optional = true }
 tokio = { version = "1", features = ["rt"], optional = true }
 
@@ -61,7 +62,7 @@ async-native-tls = { version = "0.3", optional = true }
 [features]
 default = ["acl", "streams", "geospatial", "script"]
 acl = []
-aio = ["bytes", "pin-project-lite", "futures-util", "futures-util/sink", "tokio/io-util", "tokio-util", "tokio-util/codec", "tokio/sync", "combine/tokio"]
+aio = ["bytes", "pin-project", "pin-project-lite", "futures-util", "futures-util/sink", "tokio/io-util", "tokio-util", "tokio-util/codec", "tokio/sync", "combine/tokio"]
 geospatial = []
 cluster = ["crc16", "rand"]
 script = ["sha1"]

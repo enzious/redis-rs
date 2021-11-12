@@ -1,6 +1,5 @@
 //! Adds experimental async IO support to redis.
 use async_trait::async_trait;
-use futures::stream::MapOk;
 use tokio_util::codec::Framed;
 use std::collections::VecDeque;
 use std::io;
@@ -32,6 +31,7 @@ use futures_util::{
     stream::{self, Stream, StreamExt, TryStreamExt as _},
 };
 
+use pin_project::pinned_drop;
 use pin_project_lite::pin_project;
 
 use crate::cmd::{cmd, Cmd};
@@ -196,7 +196,7 @@ where
     /// This can be useful in cases where the stream needs to be returned or held by something other
     //  than the [`PubSub`].
     pub async fn into_on_message(self) -> impl Stream<Item = Result<Option<Msg>, RedisError>> {
-        PubSubFramed(
+        PubSubFramed::new(
             ValueCodec::default()
                 .framed(self.con.con)
         )
@@ -211,7 +211,18 @@ where
     }
 }
 
-pub struct PubSubFramed<T: AsyncRead + AsyncWrite + Sized>(Framed<T, ValueCodec>);
+
+struct PubSubFramed<T: AsyncRead + AsyncWrite + Sized> {
+    framed: Option<Framed<T, ValueCodec>>,
+}
+
+impl<T: AsyncRead + AsyncWrite + Sized> PubSubFramed<T> {
+    pub fn new(framed: Framed<T, ValueCodec>) -> PubSubFramed<T> {
+        PubSubFramed {
+            framed: Some(framed),
+        }
+    }
+}
 
 impl<T: AsyncRead + AsyncWrite + Sized> Stream for PubSubFramed<T> {
     type Item = <Framed<T, ValueCodec> as Stream>::Item;
@@ -220,15 +231,18 @@ impl<T: AsyncRead + AsyncWrite + Sized> Stream for PubSubFramed<T> {
         self: Pin<&mut Self>,
         cx: &mut task::Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-        <Framed<T, ValueCodec> as Stream>::poll_next(Pin::new(&mut self.0), cx)
+        match self.framed {
+            Some(ref mut framed) => Pin::new(framed).poll_next(cx),
+            _ => panic!("should not happen"),
+        }
     }
 }
 
-impl<T: AsyncRead + AsyncWrite + Sized> Drop for PubSubFramed<T> {
-    fn drop(&mut self) {
-        todo!()
-    }
-}
+// impl<T: AsyncMuxSized> Drop for PubSubFramed<T> {
+//     fn drop(&mut self) {
+//         todo!()
+//     }
+// }
 
 impl<C> Monitor<C>
 where
