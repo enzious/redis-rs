@@ -356,6 +356,7 @@ assert_eq!(result, Ok(("foo".to_string(), b"bar".to_vec())));
 #![warn(missing_docs)]
 #![cfg_attr(docsrs, warn(broken_intra_doc_links))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
+#![feature(toowned_clone_into)]
 
 // public api
 pub use crate::client::Client;

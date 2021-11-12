@@ -1,6 +1,8 @@
 //! Adds experimental async IO support to redis.
 use async_trait::async_trait;
 use tokio_util::codec::Framed;
+use tokio_util::codec::FramedParts;
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io;
 use std::mem;
@@ -128,16 +130,58 @@ impl Runtime {
 pub trait AsyncStream: AsyncRead + AsyncWrite {}
 impl<S> AsyncStream for S where S: AsyncRead + AsyncWrite {}
 
+#[pin_project::pin_project(PinnedDrop)]
+struct PubSubFramed<T: AsyncRead + AsyncWrite + Sized> {
+    #[pin]
+    framed: Framed<T, ValueCodec>,
+    overflow: RefCell<bytes::BytesMut>,
+}
+
+impl<T: AsyncRead + AsyncWrite + Sized> PubSubFramed<T> {
+    pub fn new(framed: Framed<T, ValueCodec>, overflow: RefCell<bytes::BytesMut>) -> PubSubFramed<T> {
+        PubSubFramed {
+            framed,
+            overflow,
+        }
+    }
+}
+
+impl<T: AsyncRead + AsyncWrite + Sized> Stream for PubSubFramed<T> {
+    type Item = <Framed<T, ValueCodec> as Stream>::Item;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        let this = self.project();
+        <Framed<T, ValueCodec> as Stream>::poll_next(this.framed, cx)
+    }
+}
+
+#[pinned_drop]
+impl<T: AsyncRead + AsyncWrite + Sized> PinnedDrop for PubSubFramed<T> {
+    fn drop(self: Pin<&mut Self>) {
+        let this = self.project();
+        let buffer: &bytes::BytesMut = (& *this.framed).read_buffer();
+        
+        if buffer.len() > 0 {
+            buffer.clone_into(&mut *this.overflow.borrow_mut());
+        }
+    }
+}
+
 /// Represents a `PubSub` connection.
 pub struct PubSub<C = Pin<Box<dyn AsyncStream + Send + Sync>>> {
     con: Connection<C>,
     buf: Vec<u8>,
+    overflow: RefCell<bytes::BytesMut>,
 }
 
 /// Represents a `Monitor` connection.
 pub struct Monitor<C = Pin<Box<dyn AsyncStream + Send + Sync>>> {
     con: Connection<C>,
     buf: Vec<u8>,
+    overflow: RefCell<bytes::BytesMut>,
 }
 
 impl<C> PubSub<C>
@@ -148,6 +192,7 @@ where
         Self {
             con,
             buf: Vec::new(),
+            overflow: RefCell::new(bytes::BytesMut::new()),
         }
     }
 
@@ -183,10 +228,23 @@ where
     /// The message itself is still generic and can be converted into an appropriate type through
     /// the helper methods on it.
     pub fn on_message(&mut self) -> impl Stream<Item = Result<Option<Msg>, RedisError>> + '_ {
-        let out = ValueCodec::default()
-            .framed(&mut self.con.con)
-            .map_ok(|msg| Msg::from_value(&msg));
-        out
+        let overflow = self.overflow.clone();
+
+        let mut parts = FramedParts::new(&mut self.con.con, ValueCodec::default());
+
+        {
+            let mut leftover = overflow.borrow_mut();
+            if leftover.len() > 0 {
+                parts.read_buf = leftover.split_to(0);
+            }
+        }
+
+        PubSubFramed::new(
+            Framed::from_parts(parts),
+            overflow,
+        )
+            .into_stream()
+            .map_ok(|msg| Msg::from_value(&msg))
     }
 
     /// Returns [`Stream`] of [`Msg`]s from this [`PubSub`]s subscriptions consuming it.
@@ -196,10 +254,9 @@ where
     /// This can be useful in cases where the stream needs to be returned or held by something other
     //  than the [`PubSub`].
     pub async fn into_on_message(self) -> impl Stream<Item = Result<Option<Msg>, RedisError>> {
-        PubSubFramed::new(
-            ValueCodec::default()
-                .framed(self.con.con)
-        )
+        ValueCodec::default()
+            .framed(self.con.con)
+            .into_stream()
             .map_ok(|msg| Msg::from_value(&msg))
     }
 
@@ -211,39 +268,6 @@ where
     }
 }
 
-
-struct PubSubFramed<T: AsyncRead + AsyncWrite + Sized> {
-    framed: Option<Framed<T, ValueCodec>>,
-}
-
-impl<T: AsyncRead + AsyncWrite + Sized> PubSubFramed<T> {
-    pub fn new(framed: Framed<T, ValueCodec>) -> PubSubFramed<T> {
-        PubSubFramed {
-            framed: Some(framed),
-        }
-    }
-}
-
-impl<T: AsyncRead + AsyncWrite + Sized> Stream for PubSubFramed<T> {
-    type Item = <Framed<T, ValueCodec> as Stream>::Item;
-
-    fn poll_next(
-        self: Pin<&mut Self>,
-        cx: &mut task::Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
-        match self.framed {
-            Some(ref mut framed) => Pin::new(framed).poll_next(cx),
-            _ => panic!("should not happen"),
-        }
-    }
-}
-
-// impl<T: AsyncMuxSized> Drop for PubSubFramed<T> {
-//     fn drop(&mut self) {
-//         todo!()
-//     }
-// }
-
 impl<C> Monitor<C>
 where
     C: Unpin + AsyncRead + AsyncWrite + Send,
@@ -253,6 +277,7 @@ where
         Self {
             con,
             buf: Vec::new(),
+            overflow: RefCell::new(bytes::BytesMut::new()),
         }
     }
 
@@ -270,8 +295,22 @@ where
 
     /// Returns [`Stream`] of [`FromRedisValue`] values from this [`Monitor`]ing connection
     pub fn on_message<T: FromRedisValue>(&mut self) -> impl Stream<Item = T> + '_ {
-        ValueCodec::default()
-            .framed(&mut self.con.con)
+        let overflow = self.overflow.clone();
+
+        let mut parts = FramedParts::new(&mut self.con.con, ValueCodec::default());
+
+        {
+            let mut leftover = overflow.borrow_mut();
+            if leftover.len() > 0 {
+                parts.read_buf = leftover.split_to(0);
+            }
+        }
+
+        PubSubFramed::new(
+            Framed::from_parts(parts),
+            overflow,
+        )
+            .into_stream()
             .filter_map(|value| Box::pin(async move { T::from_redis_value(&value.ok()?).ok() }))
     }
 
@@ -279,6 +318,7 @@ where
     pub fn into_on_message<T: FromRedisValue>(self) -> impl Stream<Item = T> {
         ValueCodec::default()
             .framed(self.con.con)
+            .into_stream()
             .filter_map(|value| Box::pin(async move { T::from_redis_value(&value.ok()?).ok() }))
     }
 }
