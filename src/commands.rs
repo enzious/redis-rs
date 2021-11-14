@@ -2046,9 +2046,9 @@ impl PubSubCommands for Connection {
     }
 }
 
-/// Options for the [LPOS] command
+/// Options for the \[LPOS\] command
 ///
-/// https://redis.io/commands/lpos
+/// <https://redis.io/commands/lpos>
 ///
 /// # Example
 ///

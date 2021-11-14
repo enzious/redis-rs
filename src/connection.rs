@@ -664,6 +664,21 @@ impl Connection {
         Ok(())
     }
 
+    fn packed_command(&mut self, cmd: &[u8]) -> RedisResult<()> {
+        if self.pubsub {
+            self.exit_pubsub()?;
+        }
+
+        self.con.send_bytes(cmd)?;
+        Ok(())
+    }
+
+    /// Sends a [Cmd](Cmd) into the TCP socket and does not read a response from it.
+    fn command(&mut self, cmd: &Cmd) -> RedisResult<()> {
+        let pcmd = cmd.get_packed_command();
+        self.packed_command(&pcmd)
+    }
+
     /// Fetches a single response from the connection.  This is useful
     /// if used in combination with `send_packed_command`.
     pub fn recv_response(&mut self) -> RedisResult<Value> {
@@ -892,22 +907,22 @@ impl<'a> PubSub<'a> {
 
     /// Subscribes to a new channel.
     pub fn subscribe<T: ToRedisArgs>(&mut self, channel: T) -> RedisResult<()> {
-        Ok(cmd("SUBSCRIBE").arg(channel).query(self.con)?)
+        self.con.command(cmd("SUBSCRIBE").arg(channel))
     }
 
     /// Subscribes to a new channel with a pattern.
     pub fn psubscribe<T: ToRedisArgs>(&mut self, pchannel: T) -> RedisResult<()> {
-        Ok(cmd("PSUBSCRIBE").arg(pchannel).query(self.con)?)
+        self.con.command(cmd("PSUBSCRIBE").arg(pchannel))
     }
 
     /// Unsubscribes from a channel.
     pub fn unsubscribe<T: ToRedisArgs>(&mut self, channel: T) -> RedisResult<()> {
-        Ok(cmd("UNSUBSCRIBE").arg(channel).query(self.con)?)
+        self.con.command(cmd("UNSUBSCRIBE").arg(channel))
     }
 
     /// Unsubscribes from a channel with a pattern.
     pub fn punsubscribe<T: ToRedisArgs>(&mut self, pchannel: T) -> RedisResult<()> {
-        Ok(cmd("PUNSUBSCRIBE").arg(pchannel).query(self.con)?)
+        self.con.command(cmd("PUNSUBSCRIBE").arg(pchannel))
     }
 
     /// Fetches the next message from the pubsub connection.  Blocks until
