@@ -274,7 +274,9 @@ where
             PubSubSink::new(sink),
             stream
                 .into_stream()
-                .map_ok(|msg| Msg::from_value(&msg)),
+                .map(|msg| {
+                    msg.and_then(|msg| msg.map(|msg| Msg::from_value(&msg)))
+                }),
         )
     }
 
@@ -291,7 +293,9 @@ where
             MonitorSink::new(sink),
             stream
                 .into_stream()
-                .map_ok(|msg| Msg::from_value(&msg)),
+                .map(|msg| {
+                    msg.and_then(|msg| msg.map(|msg| Msg::from_value(&msg)))
+                }),
         )
     }
 
