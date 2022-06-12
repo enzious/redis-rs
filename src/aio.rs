@@ -1,8 +1,7 @@
 //! Adds experimental async IO support to redis.
 use async_trait::async_trait;
-use futures_util::SinkExt;
 use futures_util::stream::SplitSink;
-use tokio_util::codec::{Framed, FramedParts};
+use futures_util::SinkExt;
 use std::collections::VecDeque;
 use std::io;
 use std::mem;
@@ -11,6 +10,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::pin::Pin;
 use std::task::{self, Poll};
+use tokio_util::codec::{Framed, FramedParts};
 
 use combine::{parser::combinator::AnySendSyncPartialState, stream::PointerOffset};
 
@@ -139,9 +139,7 @@ where
 {
     /// Create a [`PubSubSink`] from a [`Connection`]
     fn new(sink: SplitSink<Framed<C, ValueCodec>, Vec<u8>>) -> Self {
-        Self {
-            sink,
-        }
+        Self { sink }
     }
 
     /// Deliver the PUBSUB command to this the PUBSUB connection.
@@ -184,9 +182,7 @@ where
 {
     /// Create a [`MonitorSink`] from a [`Connection`]
     fn new(sink: SplitSink<Framed<C, ValueCodec>, Vec<u8>>) -> Self {
-        Self {
-            sink,
-        }
+        Self { sink }
     }
 
     /// Deliver the MONITOR command to this the MONITOR connection.
@@ -262,7 +258,9 @@ where
     }
 
     /// Converts this [`Connection`] into [`PubSubSink`] and a [`Stream`] of [`Msg`].
-    pub fn into_pubsub(self) -> (
+    pub fn into_pubsub(
+        self,
+    ) -> (
         PubSubSink<C>,
         impl Stream<Item = Result<Option<Msg>, RedisError>>,
     ) {
@@ -274,14 +272,14 @@ where
             PubSubSink::new(sink),
             stream
                 .into_stream()
-                .map(|msg| {
-                    msg.and_then(|msg| msg.map(|msg| Msg::from_value(&msg)))
-                }),
+                .map(|msg| msg.and_then(|msg| msg.map(|msg| Msg::from_value(&msg)))),
         )
     }
 
     /// Converts this [`Connection`] into [`MonitorSink`] and a [`Stream`] of [`Msg`].
-    pub fn into_monitor(self) -> (
+    pub fn into_monitor(
+        self,
+    ) -> (
         MonitorSink<C>,
         impl Stream<Item = Result<Option<Msg>, RedisError>>,
     ) {
@@ -293,9 +291,7 @@ where
             MonitorSink::new(sink),
             stream
                 .into_stream()
-                .map(|msg| {
-                    msg.and_then(|msg| msg.map(|msg| Msg::from_value(&msg)))
-                }),
+                .map(|msg| msg.and_then(|msg| msg.map(|msg| Msg::from_value(&msg)))),
         )
     }
 
