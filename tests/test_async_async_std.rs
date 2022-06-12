@@ -290,7 +290,7 @@ fn test_script() {
 #[cfg(feature = "script")]
 fn test_script_load() {
     let ctx = TestContext::new();
-    let mut con = ctx.connection();
+    let _con = ctx.connection();
 
     let script = redis::Script::new("return 'Hello World'");
 
