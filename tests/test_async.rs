@@ -475,6 +475,10 @@ mod pub_sub {
         block_on_all(async move {
             let (mut sink, mut stream) = ctx.async_connection().await?.into_pubsub();
             sink.subscribe("phonewave").await?;
+
+            // Skip subscription response
+            let _ = stream.next().await;
+
             let mut publish_conn = ctx.async_connection().await?;
             publish_conn.publish("phonewave", "banana").await?;
 
