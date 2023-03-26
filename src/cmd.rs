@@ -1,3 +1,10 @@
+#[cfg(feature = "aio")]
+use futures_util::{
+    task::{Context, Poll},
+    FutureExt, Stream,
+};
+#[cfg(feature = "aio")]
+use std::pin::Pin;
 use std::{fmt, io};
 
 use crate::connection::ConnectionLike;
@@ -117,6 +124,17 @@ impl<'a, T: FromRedisValue + 'a> AsyncIter<'a, T> {
     }
 }
 
+#[cfg(feature = "aio")]
+impl<'a, T: FromRedisValue + Unpin + 'a> Stream for AsyncIter<'a, T> {
+    type Item = T;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<T>> {
+        let this = self.get_mut();
+        let mut future = Box::pin(this.next_item());
+        future.poll_unpin(cx)
+    }
+}
+
 fn countdigits(mut v: usize) -> usize {
     let mut result = 1;
     loop {
@@ -185,8 +203,11 @@ fn write_command<'a, I>(cmd: &mut (impl ?Sized + io::Write), args: I, cursor: u6
 where
     I: IntoIterator<Item = Arg<&'a [u8]>> + Clone + ExactSizeIterator,
 {
+    let mut buf = ::itoa::Buffer::new();
+
     cmd.write_all(b"*")?;
-    ::itoa::write(&mut *cmd, args.len())?;
+    let s = buf.format(args.len());
+    cmd.write_all(s.as_bytes())?;
     cmd.write_all(b"\r\n")?;
 
     let mut cursor_bytes = itoa::Buffer::new();
@@ -197,7 +218,8 @@ where
         };
 
         cmd.write_all(b"$")?;
-        ::itoa::write(&mut *cmd, bytes.len())?;
+        let s = buf.format(bytes.len());
+        cmd.write_all(s.as_bytes())?;
         cmd.write_all(b"\r\n")?;
 
         cmd.write_all(bytes)?;
@@ -242,7 +264,7 @@ impl Default for Cmd {
 /// redis::cmd("SET").arg("my_key").arg(42);
 /// ```
 ///
-/// Because currently rust's currently does not have an ideal system
+/// Because Rust currently does not have an ideal system
 /// for lifetimes of temporaries, sometimes you need to hold on to
 /// the initially generated command:
 ///

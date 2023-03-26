@@ -352,6 +352,20 @@ fn test_script() {
 
 #[test]
 #[cfg(feature = "script")]
+fn test_script_load() {
+    let ctx = TestContext::new();
+    let script = redis::Script::new("return 'Hello World'");
+
+    block_on_all(async move {
+        let mut con = ctx.multiplexed_async_connection().await.unwrap();
+
+        let hash = script.prepare_invoke().load_async(&mut con).await.unwrap();
+        assert_eq!(hash, script.get_hash().to_string());
+    });
+}
+
+#[test]
+#[cfg(feature = "script")]
 fn test_script_returning_complex_type() {
     let ctx = TestContext::new();
     block_on_all(async {
@@ -426,10 +440,12 @@ async fn io_error_on_kill_issue_320() {
 async fn invalid_password_issue_343() {
     let ctx = TestContext::new();
     let coninfo = redis::ConnectionInfo {
-        addr: Box::new(ctx.server.get_client_addr().clone()),
-        db: 0,
-        username: None,
-        passwd: Some("asdcasc".to_string()),
+        addr: ctx.server.get_client_addr().clone(),
+        redis: redis::RedisConnectionInfo {
+            db: 0,
+            username: None,
+            password: Some("asdcasc".to_string()),
+        },
     };
     let client = redis::Client::open(coninfo).unwrap();
     let err = client
@@ -457,13 +473,16 @@ mod pub_sub {
 
         let ctx = TestContext::new();
         block_on_all(async move {
-            let mut pubsub_conn = ctx.async_connection().await?.into_pubsub();
-            pubsub_conn.subscribe("phonewave").await?;
-            let mut pubsub_stream = pubsub_conn.on_message();
+            let (mut sink, mut stream) = ctx.async_connection().await?.into_pubsub();
+            sink.subscribe("phonewave").await?;
+
+            // Skip subscription response
+            let _ = stream.next().await;
+
             let mut publish_conn = ctx.async_connection().await?;
             publish_conn.publish("phonewave", "banana").await?;
 
-            let msg_payload: String = pubsub_stream.next().await.unwrap().get_payload()?;
+            let msg_payload: String = stream.next().await.unwrap()?.unwrap().get_payload()?;
             assert_eq!("banana".to_string(), msg_payload);
 
             Ok(())
@@ -480,9 +499,9 @@ mod pub_sub {
 
         let ctx = TestContext::new();
         block_on_all(async move {
-            let mut pubsub_conn = ctx.async_connection().await?.into_pubsub();
-            pubsub_conn.subscribe(SUBSCRIPTION_KEY).await?;
-            pubsub_conn.unsubscribe(SUBSCRIPTION_KEY).await?;
+            let (mut sink, _stream) = ctx.async_connection().await?.into_pubsub();
+            sink.subscribe(SUBSCRIPTION_KEY).await?;
+            sink.unsubscribe(SUBSCRIPTION_KEY).await?;
 
             let mut conn = ctx.async_connection().await?;
             let subscriptions_counts: HashMap<String, u32> = redis::cmd("PUBSUB")
@@ -507,46 +526,28 @@ mod pub_sub {
 
         let ctx = TestContext::new();
         block_on_all(async move {
-            let mut pubsub_conn = ctx.async_connection().await?.into_pubsub();
-            pubsub_conn.subscribe(SUBSCRIPTION_KEY).await?;
-            drop(pubsub_conn);
-
-            std::thread::sleep(Duration::from_millis(50));
+            let (mut sink, stream) = ctx.async_connection().await?.into_pubsub();
+            sink.subscribe(SUBSCRIPTION_KEY).await?;
+            drop(sink);
+            drop(stream);
 
             let mut conn = ctx.async_connection().await?;
-            let subscriptions_counts: HashMap<String, u32> = redis::cmd("PUBSUB")
-                .arg("NUMSUB")
-                .arg(SUBSCRIPTION_KEY)
-                .query_async(&mut conn)
-                .await?;
-            let subscription_count = *subscriptions_counts.get(SUBSCRIPTION_KEY).unwrap();
+            let mut subscription_count = 1;
+            // Allow for the unsubscription to occur within 5 seconds
+            for _ in 0..100 {
+                let subscriptions_counts: HashMap<String, u32> = redis::cmd("PUBSUB")
+                    .arg("NUMSUB")
+                    .arg(SUBSCRIPTION_KEY)
+                    .query_async(&mut conn)
+                    .await?;
+                subscription_count = *subscriptions_counts.get(SUBSCRIPTION_KEY).unwrap();
+                if subscription_count == 0 {
+                    break;
+                }
+
+                std::thread::sleep(Duration::from_millis(50));
+            }
             assert_eq!(subscription_count, 0);
-
-            Ok(())
-        })
-        .map_err(|err: RedisError| err)
-        .unwrap();
-    }
-
-    #[test]
-    fn pub_sub_conn_reuse() {
-        use redis::RedisError;
-
-        let ctx = TestContext::new();
-        block_on_all(async move {
-            let mut pubsub_conn = ctx.async_connection().await?.into_pubsub();
-            pubsub_conn.subscribe("phonewave").await?;
-            pubsub_conn.psubscribe("*").await?;
-
-            let mut conn = pubsub_conn.into_connection().await;
-            redis::cmd("SET")
-                .arg("foo")
-                .arg("bar")
-                .query_async(&mut conn)
-                .await?;
-
-            let res: String = redis::cmd("GET").arg("foo").query_async(&mut conn).await?;
-            assert_eq!(&res, "bar");
 
             Ok(())
         })

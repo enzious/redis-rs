@@ -190,7 +190,7 @@ impl ToRedisArgs for StreamReadOptions {
 
         if let Some(ref group) = self.group {
             // noack is only available w/ xreadgroup
-            if let Some(true) = self.noack {
+            if self.noack == Some(true) {
                 out.write_arg(b"NOACK");
             }
 
@@ -432,10 +432,10 @@ impl StreamId {
         let mut stream_id = StreamId::default();
         if let Value::Bulk(ref values) = *v {
             if let Some(v) = values.get(0) {
-                stream_id.id = from_redis_value(&v)?;
+                stream_id.id = from_redis_value(v)?;
             }
             if let Some(v) = values.get(1) {
-                stream_id.map = from_redis_value(&v)?;
+                stream_id.map = from_redis_value(v)?;
             }
         }
 
@@ -446,7 +446,7 @@ impl StreamId {
     /// type.
     pub fn get<T: FromRedisValue>(&self, key: &str) -> Option<T> {
         match self.map.get(key) {
-            Some(ref x) => from_redis_value(*x).ok(),
+            Some(x) => from_redis_value(x).ok(),
             None => None,
         }
     }
@@ -542,16 +542,15 @@ impl FromRedisValue for StreamPendingReply {
             result.start_id = start_id;
             result.end_id = end_id;
 
-            for cd in consumer_data {
-                if let Some((name, pending)) = cd {
-                    let mut info = StreamInfoConsumer::default();
-                    info.name = name;
-                    if let Ok(v) = pending.parse::<usize>() {
-                        info.pending = v;
-                    }
-                    result.consumers.push(info);
-                }
-            }
+            result.consumers = consumer_data
+                .into_iter()
+                .flatten()
+                .map(|(name, pending)| StreamInfoConsumer {
+                    name,
+                    pending: pending.parse().unwrap_or_default(),
+                    ..Default::default()
+                })
+                .collect();
 
             Ok(StreamPendingReply::Data(result))
         }

@@ -25,6 +25,20 @@ macro_rules! invalid_type_error_inner {
     };
 }
 
+/// Helper enum that is used to define expiry time
+pub enum Expiry {
+    /// EX seconds -- Set the specified expire time, in seconds.
+    EX(usize),
+    /// PX milliseconds -- Set the specified expire time, in milliseconds.
+    PX(usize),
+    /// EXAT timestamp-seconds -- Set the specified Unix time at which the key will expire, in seconds.
+    EXAT(usize),
+    /// PXAT timestamp-milliseconds -- Set the specified Unix time at which the key will expire, in milliseconds.
+    PXAT(usize),
+    /// PERSIST -- Remove the time to live associated with the key.
+    PERSIST,
+}
+
 /// Helper enum that is used in some situations to describe
 /// the behavior of arguments in a numeric context.
 #[derive(PartialEq, Eq, Clone, Debug, Copy)]
@@ -364,7 +378,7 @@ impl RedisError {
             ErrorKind::MasterDown => Some("MASTERDOWN"),
             ErrorKind::ReadOnly => Some("READONLY"),
             _ => match self.repr {
-                ErrorRepr::ExtensionError(ref code, _) => Some(&code),
+                ErrorRepr::ExtensionError(ref code, _) => Some(code),
                 _ => None,
             },
         }
@@ -420,6 +434,7 @@ impl RedisError {
     pub fn is_connection_refusal(&self) -> bool {
         match self.repr {
             ErrorRepr::IoError(ref err) => {
+                #[allow(clippy::match_like_matches_macro)]
                 match err.kind() {
                     io::ErrorKind::ConnectionRefused => true,
                     // if we connect to a unix socket and the file does not
@@ -478,7 +493,7 @@ impl RedisError {
     #[deprecated(note = "use code() instead")]
     pub fn extension_error_code(&self) -> Option<&str> {
         match self.repr {
-            ErrorRepr::ExtensionError(ref code, _) => Some(&code),
+            ErrorRepr::ExtensionError(ref code, _) => Some(code),
             _ => None,
         }
     }
@@ -573,7 +588,7 @@ impl InfoDict {
     /// Typical types are `String`, `bool` and integer types.
     pub fn get<T: FromRedisValue>(&self, key: &str) -> Option<T> {
         match self.find(&key) {
-            Some(ref x) => from_redis_value(*x).ok(),
+            Some(x) => from_redis_value(x).ok(),
             None => None,
         }
     }
@@ -606,7 +621,7 @@ pub trait RedisWrite {
 
     /// Accepts a serialized redis command.
     fn write_arg_fmt(&mut self, arg: impl fmt::Display) {
-        self.write_arg(&arg.to_string().as_bytes())
+        self.write_arg(arg.to_string().as_bytes())
     }
 }
 
@@ -710,16 +725,35 @@ macro_rules! itoa_based_to_redis_impl {
     };
 }
 
-macro_rules! dtoa_based_to_redis_impl {
+macro_rules! non_zero_itoa_based_to_redis_impl {
     ($t:ty, $numeric:expr) => {
         impl ToRedisArgs for $t {
             fn write_redis_args<W>(&self, out: &mut W)
             where
                 W: ?Sized + RedisWrite,
             {
-                let mut buf = Vec::new();
-                ::dtoa::write(&mut buf, *self).unwrap();
-                out.write_arg(&buf)
+                let mut buf = ::itoa::Buffer::new();
+                let s = buf.format(self.get());
+                out.write_arg(s.as_bytes())
+            }
+
+            fn describe_numeric_behavior(&self) -> NumericBehavior {
+                $numeric
+            }
+        }
+    };
+}
+
+macro_rules! ryu_based_to_redis_impl {
+    ($t:ty, $numeric:expr) => {
+        impl ToRedisArgs for $t {
+            fn write_redis_args<W>(&self, out: &mut W)
+            where
+                W: ?Sized + RedisWrite,
+            {
+                let mut buf = ::ryu::Buffer::new();
+                let s = buf.format(*self);
+                out.write_arg(s.as_bytes())
             }
 
             fn describe_numeric_behavior(&self) -> NumericBehavior {
@@ -734,9 +768,9 @@ impl ToRedisArgs for u8 {
     where
         W: ?Sized + RedisWrite,
     {
-        let mut buf = [0u8; 3];
-        let n = ::itoa::write(&mut buf[..], *self).unwrap();
-        out.write_arg(&buf[..n])
+        let mut buf = ::itoa::Buffer::new();
+        let s = buf.format(*self);
+        out.write_arg(s.as_bytes())
     }
 
     fn make_arg_vec<W>(items: &[u8], out: &mut W)
@@ -761,8 +795,19 @@ itoa_based_to_redis_impl!(u64, NumericBehavior::NumberIsInteger);
 itoa_based_to_redis_impl!(isize, NumericBehavior::NumberIsInteger);
 itoa_based_to_redis_impl!(usize, NumericBehavior::NumberIsInteger);
 
-dtoa_based_to_redis_impl!(f32, NumericBehavior::NumberIsFloat);
-dtoa_based_to_redis_impl!(f64, NumericBehavior::NumberIsFloat);
+non_zero_itoa_based_to_redis_impl!(core::num::NonZeroU8, NumericBehavior::NumberIsInteger);
+non_zero_itoa_based_to_redis_impl!(core::num::NonZeroI8, NumericBehavior::NumberIsInteger);
+non_zero_itoa_based_to_redis_impl!(core::num::NonZeroU16, NumericBehavior::NumberIsInteger);
+non_zero_itoa_based_to_redis_impl!(core::num::NonZeroI16, NumericBehavior::NumberIsInteger);
+non_zero_itoa_based_to_redis_impl!(core::num::NonZeroU32, NumericBehavior::NumberIsInteger);
+non_zero_itoa_based_to_redis_impl!(core::num::NonZeroI32, NumericBehavior::NumberIsInteger);
+non_zero_itoa_based_to_redis_impl!(core::num::NonZeroU64, NumericBehavior::NumberIsInteger);
+non_zero_itoa_based_to_redis_impl!(core::num::NonZeroI64, NumericBehavior::NumberIsInteger);
+non_zero_itoa_based_to_redis_impl!(core::num::NonZeroUsize, NumericBehavior::NumberIsInteger);
+non_zero_itoa_based_to_redis_impl!(core::num::NonZeroIsize, NumericBehavior::NumberIsInteger);
+
+ryu_based_to_redis_impl!(f32, NumericBehavior::NumberIsFloat);
+ryu_based_to_redis_impl!(f64, NumericBehavior::NumberIsFloat);
 
 impl ToRedisArgs for bool {
     fn write_redis_args<W>(&self, out: &mut W)
@@ -774,15 +819,6 @@ impl ToRedisArgs for bool {
 }
 
 impl ToRedisArgs for String {
-    fn write_redis_args<W>(&self, out: &mut W)
-    where
-        W: ?Sized + RedisWrite,
-    {
-        out.write_arg(self.as_bytes())
-    }
-}
-
-impl<'a> ToRedisArgs for &'a String {
     fn write_redis_args<W>(&self, out: &mut W)
     where
         W: ?Sized + RedisWrite,
@@ -848,6 +884,15 @@ impl<T: ToRedisArgs> ToRedisArgs for Option<T> {
             Some(ref x) => x.is_single_arg(),
             None => false,
         }
+    }
+}
+
+impl<T: ToRedisArgs> ToRedisArgs for &T {
+    fn write_redis_args<W>(&self, out: &mut W)
+    where
+        W: ?Sized + RedisWrite,
+    {
+        (*self).write_redis_args(out)
     }
 }
 
@@ -983,10 +1028,7 @@ pub trait FromRedisValue: Sized {
     /// from another vector of values.  This primarily exists internally
     /// to customize the behavior for vectors of tuples.
     fn from_redis_values(items: &[Value]) -> RedisResult<Vec<Self>> {
-        Ok(items
-            .iter()
-            .filter_map(|item| FromRedisValue::from_redis_value(item).ok())
-            .collect())
+        items.iter().map(FromRedisValue::from_redis_value).collect()
     }
 
     /// This only exists internally as a workaround for the lack of
@@ -1235,7 +1277,7 @@ impl FromRedisValue for InfoDict {
 
 impl<T: FromRedisValue> FromRedisValue for Option<T> {
     fn from_redis_value(v: &Value) -> RedisResult<Option<T>> {
-        if let Value::Nil = *v {
+        if *v == Value::Nil {
             return Ok(None);
         }
         Ok(Some(from_redis_value(v)?))

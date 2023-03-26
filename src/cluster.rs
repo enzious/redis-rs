@@ -68,29 +68,72 @@ pub struct ClusterConnection {
     slots: RefCell<SlotMap>,
     auto_reconnect: RefCell<bool>,
     readonly: bool,
+    username: Option<String>,
     password: Option<String>,
     read_timeout: RefCell<Option<Duration>>,
     write_timeout: RefCell<Option<Duration>>,
+    tls: Option<TlsMode>,
+}
+
+#[derive(Clone, Copy)]
+enum TlsMode {
+    Secure,
+    Insecure,
+}
+
+impl TlsMode {
+    fn from_insecure_flag(insecure: bool) -> TlsMode {
+        if insecure {
+            TlsMode::Insecure
+        } else {
+            TlsMode::Secure
+        }
+    }
 }
 
 impl ClusterConnection {
     pub(crate) fn new(
         initial_nodes: Vec<ConnectionInfo>,
         readonly: bool,
+        username: Option<String>,
         password: Option<String>,
     ) -> RedisResult<ClusterConnection> {
-        let connections =
-            Self::create_initial_connections(&initial_nodes, readonly, password.clone())?;
+        let connections = Self::create_initial_connections(
+            &initial_nodes,
+            readonly,
+            username.clone(),
+            password.clone(),
+        )?;
 
         let connection = ClusterConnection {
-            initial_nodes,
             connections: RefCell::new(connections),
             slots: RefCell::new(SlotMap::new()),
             auto_reconnect: RefCell::new(true),
             readonly,
+            username,
             password,
             read_timeout: RefCell::new(None),
             write_timeout: RefCell::new(None),
+            #[cfg(feature = "tls")]
+            tls: {
+                if initial_nodes.is_empty() {
+                    None
+                } else {
+                    // TODO: Maybe should run through whole list and make sure they're all matching?
+                    match &initial_nodes.get(0).unwrap().addr {
+                        ConnectionAddr::Tcp(_, _) => None,
+                        ConnectionAddr::TcpTls {
+                            host: _,
+                            port: _,
+                            insecure,
+                        } => Some(TlsMode::from_insecure_flag(*insecure)),
+                        _ => None,
+                    }
+                }
+            },
+            #[cfg(not(feature = "tls"))]
+            tls: None,
+            initial_nodes,
         };
         connection.refresh_slots()?;
 
@@ -159,17 +202,28 @@ impl ClusterConnection {
     fn create_initial_connections(
         initial_nodes: &[ConnectionInfo],
         readonly: bool,
+        username: Option<String>,
         password: Option<String>,
     ) -> RedisResult<HashMap<String, Connection>> {
         let mut connections = HashMap::with_capacity(initial_nodes.len());
 
         for info in initial_nodes.iter() {
-            let addr = match *info.addr {
+            let addr = match info.addr {
                 ConnectionAddr::Tcp(ref host, port) => format!("redis://{}:{}", host, port),
+                ConnectionAddr::TcpTls {
+                    ref host,
+                    port,
+                    insecure,
+                } => {
+                    let tls_mode = TlsMode::from_insecure_flag(insecure);
+                    build_connection_string(host, Some(port), Some(tls_mode))
+                }
                 _ => panic!("No reach."),
             };
 
-            if let Ok(mut conn) = connect(info.clone(), readonly, password.clone()) {
+            if let Ok(mut conn) =
+                connect(info.clone(), readonly, username.clone(), password.clone())
+            {
                 if conn.check_connection() {
                     connections.insert(addr, conn);
                     break;
@@ -180,7 +234,7 @@ impl ClusterConnection {
         if connections.is_empty() {
             return Err(RedisError::from((
                 ErrorKind::IoError,
-                "It is failed to check startup nodes.",
+                "It failed to check startup nodes.",
             )));
         }
         Ok(connections)
@@ -218,9 +272,12 @@ impl ClusterConnection {
                         }
                     }
 
-                    if let Ok(mut conn) =
-                        connect(addr.as_ref(), self.readonly, self.password.clone())
-                    {
+                    if let Ok(mut conn) = connect(
+                        addr.as_ref(),
+                        self.readonly,
+                        self.username.clone(),
+                        self.password.clone(),
+                    ) {
                         if conn.check_connection() {
                             conn.set_read_timeout(*self.read_timeout.borrow())?;
                             conn.set_write_timeout(*self.write_timeout.borrow())?;
@@ -246,7 +303,7 @@ impl ClusterConnection {
         let mut samples = connections.values_mut().choose_multiple(&mut rng, len);
 
         for mut conn in samples.iter_mut() {
-            if let Ok(mut slots_data) = get_slots(&mut conn) {
+            if let Ok(mut slots_data) = get_slots(&mut conn, self.tls) {
                 slots_data.sort_by_key(|s| s.start());
                 let last_slot = slots_data.iter().try_fold(0, |prev_end, slot_data| {
                     if prev_end != slot_data.start() {
@@ -320,7 +377,12 @@ impl ClusterConnection {
         } else {
             // Create new connection.
             // TODO: error handling
-            let conn = connect(addr, self.readonly, self.password.clone())?;
+            let conn = connect(
+                addr,
+                self.readonly,
+                self.username.clone(),
+                self.password.clone(),
+            )?;
             Ok(connections.entry(addr.to_string()).or_insert(conn))
         }
     }
@@ -395,7 +457,9 @@ impl ClusterConnection {
                         let kind = err.kind();
 
                         if kind == ErrorKind::Ask {
-                            redirected = err.redirect_node().map(|x| format!("redis://{}", x.0));
+                            redirected = err
+                                .redirect_node()
+                                .map(|(node, _slot)| build_connection_string(node, None, self.tls));
                             is_asking = true;
                         } else if kind == ErrorKind::Moved {
                             // Refresh slots.
@@ -403,7 +467,9 @@ impl ClusterConnection {
                             excludes.clear();
 
                             // Request again.
-                            redirected = err.redirect_node().map(|x| format!("redis://{}", x.0));
+                            redirected = err
+                                .redirect_node()
+                                .map(|(node, _slot)| build_connection_string(node, None, self.tls));
                             is_asking = false;
                             continue;
                         } else if kind == ErrorKind::TryAgain || kind == ErrorKind::ClusterDown {
@@ -417,6 +483,7 @@ impl ClusterConnection {
                         let new_connections = Self::create_initial_connections(
                             &self.initial_nodes,
                             self.readonly,
+                            self.username.clone(),
                             self.password.clone(),
                         )?;
                         {
@@ -448,7 +515,7 @@ impl ClusterConnection {
         let mut results = vec![Value::Nil; cmds.len()];
 
         let to_retry = self
-            .send_all_commands(&cmds)
+            .send_all_commands(cmds)
             .and_then(|node_cmds| self.recv_all_commands(&mut results, &node_cmds))?;
 
         if to_retry.is_empty() {
@@ -505,7 +572,7 @@ impl ClusterConnection {
         let mut cmd_map: HashMap<String, NodeCmd> = HashMap::new();
 
         for (idx, cmd) in cmds.iter().enumerate() {
-            let addr = self.get_addr_for_cmd(&cmd)?;
+            let addr = self.get_addr_for_cmd(cmd)?;
             let nc = cmd_map
                 .entry(addr.clone())
                 .or_insert_with(|| NodeCmd::new(addr));
@@ -646,13 +713,15 @@ impl ConnectionLike for ClusterConnection {
 fn connect<T: IntoConnectionInfo>(
     info: T,
     readonly: bool,
+    username: Option<String>,
     password: Option<String>,
 ) -> RedisResult<Connection>
 where
     T: std::fmt::Debug,
 {
     let mut connection_info = info.into_connection_info()?;
-    connection_info.passwd = password;
+    connection_info.redis.username = username;
+    connection_info.redis.password = password;
     let client = super::Client::open(connection_info)?;
 
     let mut con = client.get_connection()?;
@@ -682,7 +751,7 @@ fn get_random_connection<'a>(
 }
 
 // Get slot data from connection.
-fn get_slots(connection: &mut Connection) -> RedisResult<Vec<Slot>> {
+fn get_slots(connection: &mut Connection, tls_mode: Option<TlsMode>) -> RedisResult<Vec<Slot>> {
     let mut cmd = Cmd::new();
     cmd.arg("CLUSTER").arg("SLOTS");
     let value = connection.req_command(&cmd)?;
@@ -728,11 +797,11 @@ fn get_slots(connection: &mut Connection) -> RedisResult<Vec<Slot>> {
                         }
 
                         let port = if let Value::Int(port) = node[1] {
-                            port
+                            port as u16
                         } else {
                             return None;
                         };
-                        Some(format!("redis://{}:{}", ip, port))
+                        Some(build_connection_string(&ip, Some(port), tls_mode))
                     } else {
                         None
                     }
@@ -749,4 +818,18 @@ fn get_slots(connection: &mut Connection) -> RedisResult<Vec<Slot>> {
     }
 
     Ok(result)
+}
+
+fn build_connection_string(host: &str, port: Option<u16>, tls_mode: Option<TlsMode>) -> String {
+    let host_port = match port {
+        Some(port) => format!("{}:{}", host, port),
+        None => host.to_string(),
+    };
+    match tls_mode {
+        None => format!("redis://{}", host_port),
+        Some(TlsMode::Insecure) => {
+            format!("rediss://{}/#insecure", host_port)
+        }
+        Some(TlsMode::Secure) => format!("rediss://{}", host_port),
+    }
 }
