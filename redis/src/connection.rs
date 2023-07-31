@@ -916,10 +916,11 @@ impl Connection {
         }
 
         self.con.send_bytes(cmd)?;
+
         Ok(())
     }
 
-    /// Sends a [Cmd](Cmd) into the TCP socket and does not read a response from it.
+    // Sends a [Cmd](Cmd) into the TCP socket and does not read a response from it.
     fn command(&mut self, cmd: &Cmd) -> RedisResult<()> {
         let pcmd = cmd.get_packed_command();
         self.packed_command(&pcmd)

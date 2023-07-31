@@ -24,8 +24,7 @@ use futures_util::{
 use std::net::SocketAddr;
 use std::pin::Pin;
 #[cfg(any(feature = "tokio-comp", feature = "async-std-comp"))]
-use tokio_util::codec::Decoder;
-use tokio_util::codec::Framed;
+use tokio_util::codec::{Decoder, Framed};
 
 /// Represents a stateful redis TCP connection.
 pub struct Connection<C = Pin<Box<dyn AsyncStream + Send + Sync>>> {
@@ -279,21 +278,24 @@ where
     }
 }
 
-/// Struct for sending messages to redis during PubSub connection.
+/// Represents a `PubSub` connection.
 pub struct PubSubSink<C = Pin<Box<dyn AsyncStream + Send + Sync>>> {
     sink: SplitSink<Framed<C, ValueCodec>, Vec<u8>>,
 }
+
+/// Represents a `Monitor` connection.
+pub struct Monitor<C = Pin<Box<dyn AsyncStream + Send + Sync>>>(Connection<C>);
 
 impl<C> PubSubSink<C>
 where
     C: Unpin + AsyncRead + AsyncWrite + Send,
 {
-    /// Create a [`PubSubSink`] from a [`Connection`]
+    // Create a [`PubSubSink`] from a [`Connection`]
     fn new(sink: SplitSink<Framed<C, ValueCodec>, Vec<u8>>) -> Self {
         Self { sink }
     }
 
-    /// Deliver the PUBSUB command to this the PUBSUB connection.
+    // Deliver the PUBSUB command to this PUBSUB connection
     async fn command<'a>(&'a mut self, cmd: &'a Cmd) -> RedisResult<()> {
         let mut out = Vec::new();
         cmd.write_packed_command(&mut out);
