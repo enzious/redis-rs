@@ -283,9 +283,6 @@ pub struct PubSubSink<C = Pin<Box<dyn AsyncStream + Send + Sync>>> {
     sink: SplitSink<Framed<C, ValueCodec>, Vec<u8>>,
 }
 
-/// Represents a `Monitor` connection.
-pub struct Monitor<C = Pin<Box<dyn AsyncStream + Send + Sync>>>(Connection<C>);
-
 impl<C> PubSubSink<C>
 where
     C: Unpin + AsyncRead + AsyncWrite + Send,
