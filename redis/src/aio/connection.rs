@@ -3,13 +3,15 @@ use super::async_std;
 use super::ConnectionLike;
 use super::{authenticate, AsyncStream, RedisRuntime};
 use crate::cmd::{cmd, Cmd};
-use crate::connection::{ConnectionAddr, ConnectionInfo, Msg, RedisConnectionInfo};
+use crate::connection::{ConnectionAddr, ConnectionInfo, RedisConnectionInfo};
 #[cfg(any(feature = "tokio-comp", feature = "async-std-comp"))]
 use crate::parser::ValueCodec;
 use crate::types::{ErrorKind, FromRedisValue, RedisError, RedisFuture, RedisResult, Value};
-use crate::{from_redis_value, ToRedisArgs};
+use crate::{from_redis_value, ToRedisArgs, Msg};
 #[cfg(all(not(feature = "tokio-comp"), feature = "async-std-comp"))]
 use ::async_std::net::ToSocketAddrs;
+use futures_util::SinkExt;
+use futures_util::stream::SplitSink;
 use ::tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 #[cfg(feature = "tokio-comp")]
 use ::tokio::net::lookup_host;
@@ -18,6 +20,7 @@ use futures_util::{
     future::FutureExt,
     stream::{self, Stream, StreamExt},
 };
+use tokio_util::codec::Framed;
 use std::net::SocketAddr;
 use std::pin::Pin;
 #[cfg(any(feature = "tokio-comp", feature = "async-std-comp"))]
@@ -82,13 +85,51 @@ where
     }
 
     /// Converts this [`Connection`] into [`PubSub`].
-    pub fn into_pubsub(self) -> PubSub<C> {
-        PubSub::new(self)
+    pub fn into_pubsub(
+        self,
+    ) -> (
+        PubSubSink<C>,
+        impl Stream<Item = Result<Option<Msg>, RedisError>>,
+    ) {
+        let (sink, stream) = ValueCodec::default().framed(self.con).split();
+
+        (
+            PubSubSink::new(sink),
+            stream.map(|msg| msg.and_then(|msg| msg.map(|msg| Msg::from_value(&msg)))),
+        )
     }
 
-    /// Converts this [`Connection`] into [`Monitor`]
-    pub fn into_monitor(self) -> Monitor<C> {
-        Monitor::new(self)
+    /// Converts this [`Connection`] into [`MonitorSink`] and a [`Stream`] of [`Value`].
+    pub fn into_monitor(
+        self,
+    ) -> (
+        MonitorSink<C>,
+        impl Stream<Item = Result<Value, RedisError>>,
+    ) {
+        let (sink, stream) = ValueCodec::default().framed(self.con).split();
+
+        (
+            MonitorSink::new(sink),
+            stream.map(|msg| msg.and_then(|msg| msg)),
+        )
+    }
+
+    /// Returns [`Stream`] of [`FromRedisValue`] values from this [`Monitor`]ing connection
+    pub fn on_message<T: FromRedisValue>(&mut self) -> impl Stream<Item = T> + '_ {
+        ValueCodec::default()
+            .framed(&mut self.con)
+            .filter_map(|value| {
+                Box::pin(async move { T::from_redis_value(&value.ok()?.ok()?).ok() })
+            })
+    }
+
+    /// Returns [`Stream`] of [`FromRedisValue`] values from this [`Monitor`]ing connection
+    pub fn into_on_message<T: FromRedisValue>(self) -> impl Stream<Item = T> {
+        ValueCodec::default()
+            .framed(self.con)
+            .filter_map(|value| {
+                Box::pin(async move { T::from_redis_value(&value.ok()?.ok()?).ok() })
+            })
     }
 
     /// Fetches a single response from the connection.
@@ -255,109 +296,74 @@ where
     }
 }
 
-/// Represents a `PubSub` connection.
-pub struct PubSub<C = Pin<Box<dyn AsyncStream + Send + Sync>>>(Connection<C>);
+/// Struct for sending messages to redis during PubSub connection.
+pub struct PubSubSink<C = Pin<Box<dyn AsyncStream + Send + Sync>>> {
+    sink: SplitSink<Framed<C, ValueCodec>, Vec<u8>>,
+}
 
-/// Represents a `Monitor` connection.
-pub struct Monitor<C = Pin<Box<dyn AsyncStream + Send + Sync>>>(Connection<C>);
-
-impl<C> PubSub<C>
+impl<C> PubSubSink<C>
 where
     C: Unpin + AsyncRead + AsyncWrite + Send,
 {
-    fn new(con: Connection<C>) -> Self {
-        Self(con)
+    /// Create a [`PubSubSink`] from a [`Connection`]
+    fn new(sink: SplitSink<Framed<C, ValueCodec>, Vec<u8>>) -> Self {
+        Self { sink }
+    }
+
+    /// Deliver the PUBSUB command to this the PUBSUB connection.
+    async fn command<'a>(&'a mut self, cmd: &'a Cmd) -> RedisResult<()> {
+        let mut out = Vec::new();
+        cmd.write_packed_command(&mut out);
+        self.sink.send(out).await?;
+        Ok(())
     }
 
     /// Subscribes to a new channel.
     pub async fn subscribe<T: ToRedisArgs>(&mut self, channel: T) -> RedisResult<()> {
-        cmd("SUBSCRIBE").arg(channel).query_async(&mut self.0).await
+        self.command(cmd("SUBSCRIBE").arg(channel)).await
     }
 
     /// Subscribes to a new channel with a pattern.
     pub async fn psubscribe<T: ToRedisArgs>(&mut self, pchannel: T) -> RedisResult<()> {
-        cmd("PSUBSCRIBE")
-            .arg(pchannel)
-            .query_async(&mut self.0)
-            .await
+        self.command(cmd("PSUBSCRIBE").arg(pchannel)).await
     }
 
     /// Unsubscribes from a channel.
     pub async fn unsubscribe<T: ToRedisArgs>(&mut self, channel: T) -> RedisResult<()> {
-        cmd("UNSUBSCRIBE")
-            .arg(channel)
-            .query_async(&mut self.0)
-            .await
+        self.command(cmd("UNSUBSCRIBE").arg(channel)).await
     }
 
     /// Unsubscribes from a channel with a pattern.
     pub async fn punsubscribe<T: ToRedisArgs>(&mut self, pchannel: T) -> RedisResult<()> {
-        cmd("PUNSUBSCRIBE")
-            .arg(pchannel)
-            .query_async(&mut self.0)
-            .await
-    }
-
-    /// Returns [`Stream`] of [`Msg`]s from this [`PubSub`]s subscriptions.
-    ///
-    /// The message itself is still generic and can be converted into an appropriate type through
-    /// the helper methods on it.
-    pub fn on_message(&mut self) -> impl Stream<Item = Msg> + '_ {
-        ValueCodec::default()
-            .framed(&mut self.0.con)
-            .filter_map(|msg| Box::pin(async move { Msg::from_value(&msg.ok()?.ok()?) }))
-    }
-
-    /// Returns [`Stream`] of [`Msg`]s from this [`PubSub`]s subscriptions consuming it.
-    ///
-    /// The message itself is still generic and can be converted into an appropriate type through
-    /// the helper methods on it.
-    /// This can be useful in cases where the stream needs to be returned or held by something other
-    /// than the [`PubSub`].
-    pub fn into_on_message(self) -> impl Stream<Item = Msg> {
-        ValueCodec::default()
-            .framed(self.0.con)
-            .filter_map(|msg| Box::pin(async move { Msg::from_value(&msg.ok()?.ok()?) }))
-    }
-
-    /// Exits from `PubSub` mode and converts [`PubSub`] into [`Connection`].
-    pub async fn into_connection(mut self) -> Connection<C> {
-        self.0.exit_pubsub().await.ok();
-
-        self.0
+        self.command(cmd("PUNSUBSCRIBE").arg(pchannel)).await
     }
 }
 
-impl<C> Monitor<C>
+/// Represents a `Monitor` connection.
+pub struct MonitorSink<C = Pin<Box<dyn AsyncStream + Send + Sync>>> {
+    sink: SplitSink<Framed<C, ValueCodec>, Vec<u8>>,
+}
+
+impl<C> MonitorSink<C>
 where
     C: Unpin + AsyncRead + AsyncWrite + Send,
 {
-    /// Create a [`Monitor`] from a [`Connection`]
-    pub fn new(con: Connection<C>) -> Self {
-        Self(con)
+    /// Create a [`MonitorSink`] from a [`Connection`]
+    fn new(sink: SplitSink<Framed<C, ValueCodec>, Vec<u8>>) -> Self {
+        Self { sink }
+    }
+
+    /// Deliver the MONITOR command to this the MONITOR connection.
+    async fn command<'a>(&'a mut self, cmd: &'a Cmd) -> RedisResult<()> {
+        let mut out = Vec::new();
+        cmd.write_packed_command(&mut out);
+        self.sink.send(out).await?;
+        Ok(())
     }
 
     /// Deliver the MONITOR command to this [`Monitor`]ing wrapper.
     pub async fn monitor(&mut self) -> RedisResult<()> {
-        cmd("MONITOR").query_async(&mut self.0).await
-    }
-
-    /// Returns [`Stream`] of [`FromRedisValue`] values from this [`Monitor`]ing connection
-    pub fn on_message<T: FromRedisValue>(&mut self) -> impl Stream<Item = T> + '_ {
-        ValueCodec::default()
-            .framed(&mut self.0.con)
-            .filter_map(|value| {
-                Box::pin(async move { T::from_redis_value(&value.ok()?.ok()?).ok() })
-            })
-    }
-
-    /// Returns [`Stream`] of [`FromRedisValue`] values from this [`Monitor`]ing connection
-    pub fn into_on_message<T: FromRedisValue>(self) -> impl Stream<Item = T> {
-        ValueCodec::default()
-            .framed(self.0.con)
-            .filter_map(|value| {
-                Box::pin(async move { T::from_redis_value(&value.ok()?.ok()?).ok() })
-            })
+        self.command(&cmd("MONITOR")).await
     }
 }
 
