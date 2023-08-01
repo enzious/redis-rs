@@ -84,7 +84,7 @@ where
         Ok(rv)
     }
 
-    /// Converts this [`Connection`] into [`PubSub`].
+    /// Converts this [`Connection`] into [`PubSubSink`] and a [`Stream`] of [`Msg`].
     pub fn into_pubsub(
         self,
     ) -> (
@@ -343,7 +343,7 @@ where
         Ok(())
     }
 
-    /// Deliver the MONITOR command to this [`Monitor`]ing wrapper.
+    /// Deliver the MONITOR command to this [`MonitorSink`].
     pub async fn monitor(&mut self) -> RedisResult<()> {
         self.command(&cmd("MONITOR")).await
     }
