@@ -1184,22 +1184,22 @@ impl<'a> PubSub<'a> {
 
     /// Subscribes to a new channel.
     pub fn subscribe<T: ToRedisArgs>(&mut self, channel: T) -> RedisResult<()> {
-        self.con.command(cmd("SUBSCRIBE").arg(channel))
+        cmd("SUBSCRIBE").arg(channel).query(self.con)
     }
 
     /// Subscribes to a new channel with a pattern.
     pub fn psubscribe<T: ToRedisArgs>(&mut self, pchannel: T) -> RedisResult<()> {
-        self.con.command(cmd("PSUBSCRIBE").arg(pchannel))
+        cmd("PSUBSCRIBE").arg(pchannel).query(self.con)
     }
 
     /// Unsubscribes from a channel.
     pub fn unsubscribe<T: ToRedisArgs>(&mut self, channel: T) -> RedisResult<()> {
-        self.con.command(cmd("UNSUBSCRIBE").arg(channel))
+        cmd("UNSUBSCRIBE").arg(channel).query(self.con)
     }
 
     /// Unsubscribes from a channel with a pattern.
     pub fn punsubscribe<T: ToRedisArgs>(&mut self, pchannel: T) -> RedisResult<()> {
-        self.con.command(cmd("PUNSUBSCRIBE").arg(pchannel))
+        cmd("PUNSUBSCRIBE").arg(pchannel).query(self.con)
     }
 
     /// Fetches the next message from the pubsub connection.  Blocks until

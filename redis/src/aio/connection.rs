@@ -14,13 +14,9 @@ use ::tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 #[cfg(feature = "tokio-comp")]
 use ::tokio::net::lookup_host;
 use combine::{parser::combinator::AnySendSyncPartialState, stream::PointerOffset};
-use futures_util::future::select_ok;
-use futures_util::stream::SplitSink;
+use futures_util::future::{select_ok, FutureExt};
+use futures_util::stream::{SplitSink, Stream, StreamExt};
 use futures_util::SinkExt;
-use futures_util::{
-    future::FutureExt,
-    stream::{Stream, StreamExt},
-};
 use std::net::SocketAddr;
 use std::pin::Pin;
 #[cfg(any(feature = "tokio-comp", feature = "async-std-comp"))]
