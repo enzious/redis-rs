@@ -514,9 +514,6 @@ mod pub_sub {
             let mut pubsub = ctx.async_connection().await?.into_pubsub();
             pubsub.subscribe("phonewave").await?;
 
-            // Skip subscription response message
-            let _ = pubsub.next_message().await;
-
             let mut publish_conn = ctx.async_connection().await?;
             publish_conn.publish("phonewave", "banana").await?;
 
