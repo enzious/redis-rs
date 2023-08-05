@@ -511,16 +511,16 @@ mod pub_sub {
 
         let ctx = TestContext::new();
         block_on_all(async move {
-            let (mut sink, mut stream) = ctx.async_connection().await?.into_pubsub();
-            sink.subscribe("phonewave").await?;
+            let mut pubsub = ctx.async_connection().await?.into_pubsub();
+            pubsub.subscribe("phonewave").await?;
 
-            //Skip subscription response message
-            let _ = stream.next().await;
+            // Skip subscription response message
+            let _ = pubsub.next_message().await;
 
             let mut publish_conn = ctx.async_connection().await?;
             publish_conn.publish("phonewave", "banana").await?;
 
-            let msg_payload: String = stream.next().await.unwrap()?.unwrap().get_payload()?;
+            let msg_payload: String = pubsub.next_message().await.unwrap().get_payload()?;
 
             assert_eq!("banana".to_string(), msg_payload);
 
@@ -537,9 +537,9 @@ mod pub_sub {
 
         let ctx = TestContext::new();
         block_on_all(async move {
-            let (mut sink, _stream) = ctx.async_connection().await?.into_pubsub();
-            sink.subscribe(SUBSCRIPTION_KEY).await?;
-            sink.unsubscribe(SUBSCRIPTION_KEY).await?;
+            let mut pubsub = ctx.async_connection().await?.into_pubsub();
+            pubsub.subscribe(SUBSCRIPTION_KEY).await?;
+            pubsub.unsubscribe(SUBSCRIPTION_KEY).await?;
 
             let mut conn = ctx.async_connection().await?;
             let subscriptions_counts: HashMap<String, u32> = redis::cmd("PUBSUB")
@@ -563,10 +563,9 @@ mod pub_sub {
 
         let ctx = TestContext::new();
         block_on_all(async move {
-            let (mut sink, stream) = ctx.async_connection().await?.into_pubsub();
-            sink.subscribe(SUBSCRIPTION_KEY).await?;
-            drop(sink);
-            drop(stream);
+            let mut pubsub = ctx.async_connection().await?.into_pubsub();
+            pubsub.subscribe(SUBSCRIPTION_KEY).await?;
+            drop(pubsub);
 
             let mut conn = ctx.async_connection().await?;
             let mut subscription_count = 1;

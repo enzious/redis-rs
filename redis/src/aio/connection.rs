@@ -14,9 +14,11 @@ use ::tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 #[cfg(feature = "tokio-comp")]
 use ::tokio::net::lookup_host;
 use combine::{parser::combinator::AnySendSyncPartialState, stream::PointerOffset};
+use futures::channel::mpsc::{channel, Receiver};
 use futures_util::future::{select_ok, FutureExt};
-use futures_util::stream::{SplitSink, Stream, StreamExt};
+use futures_util::stream::{unfold, SplitSink, Stream, StreamExt};
 use futures_util::SinkExt;
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::pin::Pin;
 #[cfg(any(feature = "tokio-comp", feature = "async-std-comp"))]
@@ -81,18 +83,8 @@ where
     }
 
     /// Converts this [`Connection`] into [`PubSubSink`] and a [`Stream`] of [`Msg`].
-    pub fn into_pubsub(
-        self,
-    ) -> (
-        PubSubSink<C>,
-        impl Stream<Item = Result<Option<Msg>, RedisError>>,
-    ) {
-        let (sink, stream) = ValueCodec::default().framed(self.con).split();
-
-        (
-            PubSubSink::new(sink),
-            stream.map(|msg| msg.and_then(|msg| msg.map(|msg| Msg::from_value(&msg)))),
-        )
+    pub fn into_pubsub(self) -> PubSub<C> {
+        PubSub::new(self)
     }
 
     /// Converts this [`Connection`] into [`MonitorSink`] and a [`Stream`] of [`Value`].
@@ -275,25 +267,157 @@ where
 }
 
 /// Represents a `PubSub` connection.
-pub struct PubSubSink<C = Pin<Box<dyn AsyncStream + Send + Sync>>> {
-    sink: SplitSink<Framed<C, ValueCodec>, Vec<u8>>,
+pub struct PubSub<C = Pin<Box<dyn AsyncStream + Send + Sync>>> {
+    framed: Framed<C, ValueCodec>,
+    queue: VecDeque<Msg>,
 }
 
-impl<C> PubSubSink<C>
+impl<C> PubSub<C>
 where
     C: Unpin + AsyncRead + AsyncWrite + Send,
 {
-    // Create a [`PubSubSink`] from a [`Connection`]
-    fn new(sink: SplitSink<Framed<C, ValueCodec>, Vec<u8>>) -> Self {
-        Self { sink }
+    fn new(con: Connection<C>) -> PubSub<C> {
+        let framed = ValueCodec::default().framed(con.con);
+
+        PubSub {
+            framed,
+            queue: Default::default(),
+        }
     }
 
     // Deliver the PUBSUB command to this PUBSUB connection
     async fn command<'a>(&'a mut self, cmd: &'a Cmd) -> RedisResult<()> {
         let mut out = Vec::new();
+
+        cmd.write_packed_command(&mut out);
+        self.framed.send(out).await?;
+
+        self.next_response().await
+    }
+
+    async fn next_response(&mut self) -> RedisResult<()> {
+        while let Some(item) = self.framed.next().await {
+            match item {
+                Ok(Ok(value)) => match Msg::from_value(&value) {
+                    Some(msg) => self.queue.push_front(msg),
+                    _ => return Ok(()),
+                },
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+
+    /// placeholder
+    pub async fn next_message(&mut self) -> RedisResult<Msg> {
+        match self.queue.pop_back() {
+            Some(msg) => Ok(msg),
+            _ => match self.framed.next().await {
+                Some(Ok(Ok(value))) => match Msg::from_value(&value) {
+                    Some(msg) => Ok(msg),
+                    _ => Err(RedisError::from((
+                        ErrorKind::SinkDropped,
+                        "A sink corresponding to this stream has dropped",
+                    ))),
+                },
+                _ => Err(RedisError::from((
+                    ErrorKind::SinkDropped,
+                    "A sink corresponding to this stream has dropped",
+                ))),
+            },
+        }
+    }
+
+    /// placeholder
+    pub fn split(
+        self,
+    ) -> (
+        SplitPubSubSink<C>,
+        impl Stream<Item = Result<Option<Msg>, RedisError>>,
+    ) {
+        SplitPubSubSink::new(self.framed)
+    }
+
+    /// Subscribes to a new channel.
+    pub async fn subscribe<T: ToRedisArgs>(&mut self, channel: T) -> RedisResult<()> {
+        self.command(cmd("SUBSCRIBE").arg(channel)).await
+    }
+
+    /// Subscribes to a new channel with a pattern.
+    pub async fn psubscribe<T: ToRedisArgs>(&mut self, pchannel: T) -> RedisResult<()> {
+        self.command(cmd("PSUBSCRIBE").arg(pchannel)).await
+    }
+
+    /// Unsubscribes from a channel.
+    pub async fn unsubscribe<T: ToRedisArgs>(&mut self, channel: T) -> RedisResult<()> {
+        self.command(cmd("UNSUBSCRIBE").arg(channel)).await
+    }
+
+    /// Unsubscribes from a channel with a pattern.
+    pub async fn punsubscribe<T: ToRedisArgs>(&mut self, pchannel: T) -> RedisResult<()> {
+        self.command(cmd("PUNSUBSCRIBE").arg(pchannel)).await
+    }
+}
+
+/// Represents a `PubSub` connection.
+pub struct SplitPubSubSink<C = Pin<Box<dyn AsyncStream + Send + Sync>>> {
+    sink: SplitSink<Framed<C, ValueCodec>, Vec<u8>>,
+    resp_recv: Receiver<Value>,
+}
+
+impl<C> SplitPubSubSink<C>
+where
+    C: Unpin + AsyncRead + AsyncWrite + Send,
+{
+    // Create a [`PubSubSink`] from a [`Connection`]
+    fn new(
+        framed: Framed<C, ValueCodec>,
+    ) -> (
+        SplitPubSubSink<C>,
+        impl Stream<Item = Result<Option<Msg>, RedisError>>,
+    ) {
+        let (sink, stream) = framed.split();
+        let (resp_send, resp_recv) = channel::<Value>(1);
+
+        (
+            Self { sink, resp_recv },
+            unfold((stream, resp_send), |(mut stream, mut resp_send)| {
+                Box::pin(async move {
+                    let item = stream.next().await;
+
+                    match item {
+                        Some(Ok(Ok(value))) => Some(Ok(match Msg::from_value(&value) {
+                            Some(msg) => Some(msg),
+                            _ => {
+                                let _ = resp_send.send(value).await;
+
+                                None
+                            }
+                        })),
+                        _ => None,
+                    }
+                    .map(|res| (res, (stream, resp_send)))
+                })
+            }),
+        )
+    }
+
+    // Deliver the PUBSUB command to this PUBSUB connection
+    async fn command<'a>(&'a mut self, cmd: &'a Cmd) -> RedisResult<()> {
+        let mut out = Vec::new();
+
         cmd.write_packed_command(&mut out);
         self.sink.send(out).await?;
-        Ok(())
+
+        self.resp_recv
+            .next()
+            .await
+            .map(|_| ())
+            .ok_or(RedisError::from((
+                ErrorKind::SinkDropped,
+                "A sink corresponding to this stream has dropped",
+            )))
     }
 
     /// Subscribes to a new channel.
