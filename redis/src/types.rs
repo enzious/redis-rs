@@ -129,8 +129,10 @@ pub enum ErrorKind {
     EmptySentinelList,
     /// Attempted to kill a script/function while they werent' executing
     NotBusy,
-    /// A sink corresponding to the stream was dropped
-    SinkDropped,
+    /// Response was dropped
+    ResponseDropped,
+    /// Failed to forward response to split pubsub
+    ResponseForwardError,
 
     #[cfg(feature = "json")]
     /// Error Serializing a struct to JSON form
@@ -504,7 +506,8 @@ impl RedisError {
             ErrorKind::NoValidReplicasFoundBySentinel => "no valid replicas found by sentinel",
             ErrorKind::EmptySentinelList => "empty sentinel list",
             ErrorKind::NotBusy => "not busy",
-            ErrorKind::SinkDropped => "sink dropped",
+            ErrorKind::ResponseDropped => "response dropped",
+            ErrorKind::ResponseForwardError => "response forward error",
             #[cfg(feature = "json")]
             ErrorKind::Serialize => "serializing",
         }
@@ -656,7 +659,8 @@ impl RedisError {
             ErrorKind::ClientError => false,
             ErrorKind::EmptySentinelList => false,
             ErrorKind::NotBusy => false,
-            ErrorKind::SinkDropped => false,
+            ErrorKind::ResponseDropped => false,
+            ErrorKind::ResponseForwardError => false,
             #[cfg(feature = "json")]
             ErrorKind::Serialize => false,
         }

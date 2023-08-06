@@ -1,3 +1,4 @@
+use futures_util::StreamExt;
 use redis::AsyncCommands;
 
 #[tokio::main]
@@ -9,13 +10,8 @@ async fn main() -> redis::RedisResult<()> {
     pubsub.subscribe("wavephone").await?;
     publish_conn.publish("wavephone", "banana").await?;
 
-    // consume the response to the subscription
-    let _ = pubsub.next_message().await;
-
-    let pubsub_msg: String = pubsub.next_message().await.unwrap().get_payload()?;
+    let pubsub_msg: String = pubsub.next().await.unwrap().unwrap().get_payload()?;
     assert_eq!(&pubsub_msg, "banana");
-
-    println!("Received the message: {}", pubsub_msg);
 
     Ok(())
 }
