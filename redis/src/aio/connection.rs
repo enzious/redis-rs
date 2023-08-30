@@ -14,16 +14,15 @@ use ::tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 #[cfg(feature = "tokio-comp")]
 use ::tokio::net::lookup_host;
 use combine::{parser::combinator::AnySendSyncPartialState, stream::PointerOffset};
-use futures::channel::mpsc::{channel, SendError};
-use futures::channel::{mpsc, oneshot};
+use futures::channel::mpsc::{self, channel, SendError};
 use futures_util::future::{select_ok, FutureExt};
 use futures_util::stream::{SplitSink, SplitStream, Stream, StreamExt};
-use futures_util::{Future, Sink, SinkExt};
+use futures_util::{Sink, SinkExt};
 use pin_project_lite::pin_project;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::task::ready;
+use std::task::Poll;
 #[cfg(any(feature = "tokio-comp", feature = "async-std-comp"))]
 use tokio_util::codec::{Decoder, Framed};
 
@@ -351,24 +350,25 @@ impl Stream for PubSub {
     fn poll_next(
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
+    ) -> Poll<Option<Self::Item>> {
         let PubSubProj { mut framed, queue } = self.project();
 
         if let Some(msg) = queue.pop_back() {
-            return std::task::Poll::Ready(Some(Ok(msg)));
+            return Poll::Ready(Some(Ok(msg)));
         }
 
         loop {
-            match ready!(framed.as_mut().poll_next(cx)) {
-                Some(Ok(Ok(value))) => {
+            match framed.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok(Ok(value)))) => {
                     if let Some(msg) = Msg::from_value(&value) {
-                        return std::task::Poll::Ready(Some(Ok(msg)));
+                        return Poll::Ready(Some(Ok(msg)));
                     }
                 }
-                Some(Err(err)) | Some(Ok(Err(err))) => {
-                    return std::task::Poll::Ready(Some(Err(err)));
+                Poll::Ready(Some(Err(err)) | Some(Ok(Err(err)))) => {
+                    return Poll::Ready(Some(Err(err)));
                 }
-                None => return std::task::Poll::Ready(None),
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
             }
         }
     }
@@ -383,13 +383,6 @@ impl Stream for PubSub {
 pub struct SplitPubSubSink<C = Pin<Box<dyn AsyncStream + Send + Sync>>> {
     sink: SplitSink<Framed<C, ValueCodec>, Vec<u8>>,
     resp_rx: mpsc::Receiver<Value>,
-    shutdown_tx: Option<oneshot::Sender<()>>,
-}
-
-impl<C> Drop for SplitPubSubSink<C> {
-    fn drop(&mut self) {
-        let _ = self.shutdown_tx.take().map(|tx| tx.send(()));
-    }
 }
 
 impl<C> SplitPubSubSink<C>
@@ -400,15 +393,10 @@ where
     fn new(framed: Framed<C, ValueCodec>) -> (SplitPubSubSink<C>, SplitPubSubStream<C>) {
         let (sink, stream) = framed.split();
         let (resp_tx, resp_rx) = channel::<Value>(1);
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
         (
-            Self {
-                sink,
-                resp_rx,
-                shutdown_tx: Some(shutdown_tx),
-            },
-            SplitPubSubStream::new(stream, shutdown_rx, resp_tx),
+            Self { sink, resp_rx },
+            SplitPubSubStream::new(stream, resp_tx),
         )
     }
 
@@ -458,8 +446,6 @@ pin_project! {
         #[pin]
         stream: SplitStream<Framed<C, ValueCodec>>,
         #[pin]
-        shutdown_rx: oneshot::Receiver<()>,
-        #[pin]
         resp_tx: mpsc::Sender<Value>,
         resp_waiting: Option<Value>,
     }
@@ -469,14 +455,9 @@ impl<C> SplitPubSubStream<C>
 where
     C: Unpin + AsyncRead + Send,
 {
-    fn new(
-        stream: SplitStream<Framed<C, ValueCodec>>,
-        shutdown_rx: oneshot::Receiver<()>,
-        resp_tx: mpsc::Sender<Value>,
-    ) -> Self {
+    fn new(stream: SplitStream<Framed<C, ValueCodec>>, resp_tx: mpsc::Sender<Value>) -> Self {
         SplitPubSubStream {
             stream,
-            shutdown_rx,
             resp_tx,
             resp_waiting: None,
         }
@@ -498,34 +479,40 @@ impl Stream for SplitPubSubStream {
     fn poll_next(
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
+    ) -> Poll<Option<Self::Item>> {
         let SplitPubSubStreamProj {
             mut stream,
-            mut shutdown_rx,
             mut resp_tx,
             resp_waiting,
         } = self.project();
 
         loop {
-            if shutdown_rx.as_mut().poll(cx).is_ready() {
-                return std::task::Poll::Ready(None);
-            }
-
             if resp_waiting.is_some() {
-                map_response_err(ready!(resp_tx.as_mut().poll_ready(cx)))?;
-
-                map_response_err(resp_tx.as_mut().start_send(resp_waiting.take().unwrap()))?;
+                match resp_tx.as_mut().poll_ready(cx) {
+                    Poll::Ready(Ok(_)) => {
+                        if let Some(resp) = resp_waiting.take() {
+                            map_response_err(resp_tx.as_mut().start_send(resp))?;
+                        }
+                    }
+                    Poll::Ready(Err(err)) => {
+                        if !err.is_disconnected() {
+                            map_response_err(Err(err))?;
+                        }
+                    }
+                    Poll::Pending => return Poll::Pending,
+                };
             }
 
-            match ready!(stream.as_mut().poll_next(cx)) {
-                Some(Ok(Ok(value))) => match Msg::from_value(&value) {
-                    Some(msg) => return std::task::Poll::Ready(Some(Ok(msg))),
+            match stream.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok(Ok(value)))) => match Msg::from_value(&value) {
+                    Some(msg) => return Poll::Ready(Some(Ok(msg))),
                     _ => *resp_waiting = Some(value),
                 },
-                Some(Err(err)) | Some(Ok(Err(err))) => {
-                    return std::task::Poll::Ready(Some(Err(err)));
+                Poll::Ready(Some(Err(err)) | Some(Ok(Err(err)))) => {
+                    return Poll::Ready(Some(Err(err)));
                 }
-                None => return std::task::Poll::Ready(None),
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
             }
         }
     }
@@ -603,17 +590,18 @@ impl Stream for Monitor {
     fn poll_next(
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
+    ) -> Poll<Option<Self::Item>> {
         let MonitorProj { mut framed, queue } = self.project();
 
         if let Some(msg) = queue.pop_back() {
-            return std::task::Poll::Ready(Some(Ok(msg)));
+            return Poll::Ready(Some(Ok(msg)));
         }
 
-        match ready!(framed.as_mut().poll_next(cx)) {
-            Some(Ok(Ok(value))) => std::task::Poll::Ready(Some(Ok(value))),
-            Some(Err(err)) | Some(Ok(Err(err))) => std::task::Poll::Ready(Some(Err(err))),
-            None => std::task::Poll::Ready(None),
+        match framed.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(Ok(value)))) => Poll::Ready(Some(Ok(value))),
+            Poll::Ready(Some(Err(err)) | Some(Ok(Err(err)))) => Poll::Ready(Some(Err(err))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
