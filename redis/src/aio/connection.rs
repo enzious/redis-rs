@@ -440,7 +440,6 @@ where
 
 pin_project! {
     /// Represents the receiving side of a pubsub connection.
-    /// If the corresponding [`SplitPubSubSink`] is dropped, the stream will exhaust.
     #[project = SplitPubSubStreamProj]
     pub struct SplitPubSubStream<C = Pin<Box<dyn AsyncStream + Send + Sync>>> {
         #[pin]
