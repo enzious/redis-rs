@@ -11,8 +11,6 @@ async fn main() -> redis::RedisResult<()> {
 
     publish_conn.set("key", b"value").await?;
 
-    let _ = monitor.next().await;
-
     while let Some(Ok(Value::Status(msg))) = monitor.next().await {
         println!("{}", msg);
     }

@@ -89,7 +89,7 @@ where
         PubSub::new(self)
     }
 
-    /// Converts this [`Connection`] into [`Monitor`].
+    /// Converts this [`Connection`] into [`Monitor`]
     pub fn into_monitor(self) -> Monitor<C> {
         Monitor::new(self)
     }
