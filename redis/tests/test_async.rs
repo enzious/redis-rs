@@ -632,8 +632,6 @@ mod pub_sub {
             let subscription_count = *subscriptions_counts.get(SUBSCRIPTION_KEY).unwrap();
             assert_eq!(subscription_count, 0);
 
-            drop(sink);
-
             Ok::<_, RedisError>(())
         })
         .unwrap();
