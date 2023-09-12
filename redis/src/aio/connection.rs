@@ -268,10 +268,10 @@ pin_project! {
     }
 }
 
-fn next_response_err() -> RedisError {
+fn stream_dropped_error() -> RedisError {
     RedisError::from((
         ErrorKind::ResponseDropped,
-        "Response was dropped with stream",
+        "Stream was dropped, response cannot be received",
     ))
 }
 
@@ -320,7 +320,7 @@ where
             }
         }
 
-        Err(next_response_err())
+        Err(stream_dropped_error())
     }
 
     /// Subscribes to a new channel.
@@ -413,7 +413,7 @@ where
         self.resp_rx
             .next()
             .await
-            .ok_or(next_response_err())
+            .ok_or(stream_dropped_error())
             .and_then(|value| from_redis_value(&value))
     }
 
@@ -444,8 +444,8 @@ pin_project! {
     pub struct SplitPubSubStream<C = Pin<Box<dyn AsyncStream + Send + Sync>>> {
         #[pin]
         stream: SplitStream<Framed<C, ValueCodec>>,
-        #[pin]
         resp_tx: mpsc::Sender<Value>,
+        // A response in the process of be forwarded to the sink.
         resp_waiting: Option<Value>,
     }
 }
@@ -463,11 +463,11 @@ where
     }
 }
 
-fn map_response_err<T>(value: Result<T, SendError>) -> Result<T, RedisError> {
+fn map_response_forward_err<T>(value: Result<T, SendError>) -> Result<T, RedisError> {
     value.map_err(|_| {
         RedisError::from((
             ErrorKind::ResponseForwardError,
-            "Response failed to forward",
+            "Response failed to forward to sink",
         ))
     })
 }
@@ -481,21 +481,23 @@ impl Stream for SplitPubSubStream {
     ) -> Poll<Option<Self::Item>> {
         let SplitPubSubStreamProj {
             mut stream,
-            mut resp_tx,
+            resp_tx,
             resp_waiting,
         } = self.project();
 
         loop {
             if resp_waiting.is_some() {
-                match resp_tx.as_mut().poll_ready(cx) {
+                match resp_tx.poll_ready(cx) {
                     Poll::Ready(Ok(_)) => {
                         if let Some(resp) = resp_waiting.take() {
-                            map_response_err(resp_tx.as_mut().start_send(resp))?;
+                            map_response_forward_err(resp_tx.start_send(resp))?;
                         }
                     }
                     Poll::Ready(Err(err)) => {
                         if !err.is_disconnected() {
-                            map_response_err(Err(err))?;
+                            map_response_forward_err(Err(err))?;
+                        } else {
+                            drop(resp_waiting.take());
                         }
                     }
                     Poll::Pending => return Poll::Pending,
@@ -505,7 +507,11 @@ impl Stream for SplitPubSubStream {
             match stream.as_mut().poll_next(cx) {
                 Poll::Ready(Some(Ok(Ok(value)))) => match Msg::from_value(&value) {
                     Some(msg) => return Poll::Ready(Some(Ok(msg))),
-                    _ => *resp_waiting = Some(value),
+                    _ => {
+                        // This should only be reachabled if the resp_waiting conditional above is
+                        // false.
+                        *resp_waiting = Some(value)
+                    }
                 },
                 Poll::Ready(Some(Err(err)) | Some(Ok(Err(err)))) => {
                     return Poll::Ready(Some(Err(err)));
@@ -574,7 +580,7 @@ where
             }
         }
 
-        Err(next_response_err())
+        Err(stream_dropped_error())
     }
 
     /// Deliver the `MONITOR` command to this [`Monitor`].
