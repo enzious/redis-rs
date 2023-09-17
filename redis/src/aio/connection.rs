@@ -465,6 +465,8 @@ where
 
 fn map_response_forward_err<T>(value: Result<T, SendError>) -> Result<T, RedisError> {
     value.map_err(|_| {
+        // This error should never occur unless resp_tx is somehow full or dropped, which should
+        // not occur in the context of the request/response pattern.
         RedisError::from((
             ErrorKind::ResponseForwardError,
             "Response failed to forward to sink",
