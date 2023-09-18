@@ -173,10 +173,6 @@ name = "async-pub-sub"
 required-features = ["aio"]
 
 [[example]]
-name = "async-monitor"
-required-features = ["aio"]
-
-[[example]]
 name = "async-scan"
 required-features = ["aio"]
 

@@ -17,7 +17,7 @@ use combine::{parser::combinator::AnySendSyncPartialState, stream::PointerOffset
 use futures::channel::mpsc::{self, channel, SendError};
 use futures_util::future::{select_ok, FutureExt};
 use futures_util::stream::{SplitSink, SplitStream, Stream, StreamExt};
-use futures_util::{Sink, SinkExt};
+use futures_util::SinkExt;
 use pin_project_lite::pin_project;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -450,6 +450,9 @@ pin_project! {
     }
 }
 
+/// Represents a `Monitor` connection.
+pub struct Monitor<C = Pin<Box<dyn AsyncStream + Send + Sync>>>(Connection<C>);
+
 impl<C> SplitPubSubStream<C>
 where
     C: Unpin + AsyncRead + Send,
@@ -529,87 +532,36 @@ impl Stream for SplitPubSubStream {
     }
 }
 
-pin_project! {
-    /// Represents a pubsub connection.
-    #[project = MonitorProj]
-    pub struct Monitor<C = Pin<Box<dyn AsyncStream + Send + Sync>>> {
-        #[pin]
-        framed: Framed<C, ValueCodec>,
-        queue: VecDeque<Value>,
-    }
-}
-
 impl<C> Monitor<C>
 where
     C: Unpin + AsyncRead + AsyncWrite + Send,
 {
-    fn new(con: Connection<C>) -> Monitor<C> {
-        let framed = ValueCodec::default().framed(con.con);
-
-        Monitor {
-            framed,
-            queue: Default::default(),
-        }
+    /// Create a [`Monitor`] from a [`Connection`]
+    fn new(con: Connection<C>) -> Self {
+        Self(con)
     }
 
-    /// Query the connection with a command and retrieves the response.
-    pub async fn query<'a, T>(&'a mut self, cmd: &'a Cmd) -> RedisResult<T>
-    where
-        T: FromRedisValue,
-    {
-        let mut out = Vec::new();
-
-        cmd.write_packed_command(&mut out);
-        self.framed.send(out).await?;
-
-        self.next_response().await
-    }
-
-    async fn next_response<T>(&mut self) -> RedisResult<T>
-    where
-        T: FromRedisValue,
-    {
-        while let Some(item) = self.framed.next().await {
-            match item {
-                Ok(Ok(value)) => {
-                    if Msg::from_value(&value).is_some() {
-                        self.queue.push_front(value);
-                    } else {
-                        return from_redis_value(&value);
-                    }
-                }
-                _ => break,
-            }
-        }
-
-        Err(stream_dropped_error())
-    }
-
-    /// Deliver the `MONITOR` command to this [`Monitor`].
+    /// Deliver the MONITOR command to this [`Monitor`]ing wrapper.
     pub async fn monitor(&mut self) -> RedisResult<()> {
-        self.query(&cmd("MONITOR")).await
+        cmd("MONITOR").query_async(&mut self.0).await
     }
-}
 
-impl Stream for Monitor {
-    type Item = Result<Value, RedisError>;
+    /// Returns [`Stream`] of [`FromRedisValue`] values from this [`Monitor`]ing connection
+    pub fn on_message<T: FromRedisValue>(&mut self) -> impl Stream<Item = T> + '_ {
+        ValueCodec::default()
+            .framed(&mut self.0.con)
+            .filter_map(|value| {
+                Box::pin(async move { T::from_redis_value(&value.ok()?.ok()?).ok() })
+            })
+    }
 
-    fn poll_next(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
-        let MonitorProj { mut framed, queue } = self.project();
-
-        if let Some(msg) = queue.pop_back() {
-            return Poll::Ready(Some(Ok(msg)));
-        }
-
-        match framed.as_mut().poll_next(cx) {
-            Poll::Ready(Some(Ok(Ok(value)))) => Poll::Ready(Some(Ok(value))),
-            Poll::Ready(Some(Err(err)) | Some(Ok(Err(err)))) => Poll::Ready(Some(Err(err))),
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
-        }
+    /// Return [`Stream`] of [`FromRedisValue`] values from this [`Monitor`]ing connection
+    pub fn into_on_message<T: FromRedisValue>(self) -> impl Stream<Item = T> {
+        ValueCodec::default()
+            .framed(self.0.con)
+            .filter_map(|value| {
+                Box::pin(async move { T::from_redis_value(&value.ok()?.ok()?).ok() })
+            })
     }
 }
 
